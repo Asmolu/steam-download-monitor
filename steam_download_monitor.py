@@ -11,8 +11,10 @@ from pathlib import Path
 PAUSE_EPS_BYTES_PER_MIN = 256 * 1024  # <256KB/min считаем простоем/паузой
 LOG_SPEED_EPS_MB_S = 0.10  # <0.1MB/s считаем отсутствием скачивания
 
-def human_mb_per_s(bytes_per_s: float) -> str:
-    return f"{bytes_per_s / (1024 * 1024):.2f} MB/s"
+def format_speed(bytes_per_s: float) -> str:
+    mb_per_s = bytes_per_s / (1024 * 1024)
+    mbit_per_s = (bytes_per_s * 8) / 1_000_000
+    return f"{mb_per_s:.2f} MB/s ({mbit_per_s:.2f} Mbit/s)"
 
 
 def dir_size_bytes(path: Path) -> int:
@@ -185,22 +187,25 @@ def read_game_name_from_manifest(library_path: Path, appid: str) -> str | None:
     return None
 
 
-def detect_pause_from_log(steam_root: Path, appid: str) -> bool | None:
-    log_path = steam_root / "logs" / "content_log.txt"
-    t = tail_text(log_path)
-    if not t:
-        return None
+def find_pause_resume_indices(text: str, appid: str) -> tuple[int | None, int | None]:
     pause_markers = ("pause", "paused", "pausing")
     resume_markers = ("resume", "resumed", "unpause", "unpaused")
-    for line in reversed(t.splitlines()):
+    context_markers = ("download", "content", "depot", "app")
+    pause_idx = None
+    resume_idx = None
+
+    for idx, line in enumerate(reversed(text.splitlines())):
         low = line.lower()
-        if appid not in low:
+        if appid not in low and not any(marker in low for marker in context_markers):
             continue
-        if any(marker in low for marker in resume_markers):
-            return False
-        if any(marker in low for marker in pause_markers):
-            return True
-    return None
+        if resume_idx is None and any(marker in low for marker in resume_markers):
+            resume_idx = idx
+        if pause_idx is None and any(marker in low for marker in pause_markers):
+            pause_idx = idx
+        if pause_idx is not None and resume_idx is not None:
+            break
+
+    return pause_idx, resume_idx
 
 def parse_speed_from_line(line: str) -> float | None:
     """
@@ -209,7 +214,7 @@ def parse_speed_from_line(line: str) -> float | None:
     """
     patterns = [
         r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>kbit|mbit|gbit)/s",
-        r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>kb|mb|gb)/s",
+        r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>kb|mb|gb|kib|mib|gib)/s",
         r"(?P<value>\d+(?:[.,]\d+)?)\s*(?P<unit>kbps|mbps|gbps)",
     ]
     for pattern in patterns:
@@ -220,7 +225,14 @@ def parse_speed_from_line(line: str) -> float | None:
         unit = match.group("unit").lower()
         is_bits = "bit" in unit or unit.endswith("bps")
         decimal_base = 1000
-        if unit.startswith("g"):
+        binary_base = 1024
+        if unit.startswith("gi"):
+            value *= binary_base ** 3
+        elif unit.startswith("mi"):
+            value *= binary_base ** 2
+        elif unit.startswith("ki"):
+            value *= binary_base
+        elif unit.startswith("g"):
             value *= decimal_base ** 3
         elif unit.startswith("m"):
             value *= decimal_base ** 2
@@ -232,27 +244,39 @@ def parse_speed_from_line(line: str) -> float | None:
     return None
 
 
-def read_speed_from_logs(steam_root: Path, appid: str) -> float | None:
-    """
-    Считывает скорость из логов Steam (content_log.txt, connection_log.txt).
-    Возвращает bytes/sec либо None.
-    """
-    log_paths = [
-        steam_root / "logs" / "content_log.txt",
-        steam_root / "logs" / "connection_log.txt",
-    ]
-    for log_path in log_paths:
-        t = tail_text(log_path)
-        if not t:
+def find_speed_in_text(text: str, appid: str) -> tuple[float | None, int | None]:
+    for idx, line in enumerate(reversed(text.splitlines())):
+        low = line.lower()
+        if appid not in low and "download" not in low:
             continue
-        for line in reversed(t.splitlines()):
-            low = line.lower()
-            if appid not in low and "download" not in low:
-                continue
-            speed = parse_speed_from_line(line)
-            if speed is not None:
-                return speed
-    return None
+        speed = parse_speed_from_line(line)
+        if speed is not None:
+            return speed, idx
+    return None, None
+
+
+def read_log_state(steam_root: Path, appid: str) -> tuple[float | None, int | None, int | None, int | None]:
+    """
+    Возвращает (speed_bytes_per_s, speed_idx, pause_idx, resume_idx).
+    Индексы — это позиция строки в обратном порядке (0 = самая свежая).
+    """
+    content_log = steam_root / "logs" / "content_log.txt"
+    connection_log = steam_root / "logs" / "connection_log.txt"
+
+    content_text = tail_text(content_log)
+    connection_text = tail_text(connection_log)
+
+    speed, speed_idx = (None, None)
+    if content_text:
+        speed, speed_idx = find_speed_in_text(content_text, appid)
+    if speed is None and connection_text:
+        speed, speed_idx = find_speed_in_text(connection_text, appid)
+
+    pause_idx = resume_idx = None
+    if content_text:
+        pause_idx, resume_idx = find_pause_resume_indices(content_text, appid)
+
+    return speed, speed_idx, pause_idx, resume_idx
 
 
 def main():
@@ -292,22 +316,34 @@ def main():
         prev_sizes[appid] = cur
 
         bytes_per_s_disk = delta / 60.0
-        bytes_per_s_log = read_speed_from_logs(steam_root, appid)
-        bytes_per_s = bytes_per_s_log if bytes_per_s_log is not None else bytes_per_s_disk
+        bytes_per_s_log, speed_idx, pause_idx, resume_idx = read_log_state(steam_root, appid)
         paused_by_delta = delta < PAUSE_EPS_BYTES_PER_MIN
-        paused_by_log = detect_pause_from_log(steam_root, appid)
-        has_log_speed = bytes_per_s_log is not None and (bytes_per_s_log / (1024 * 1024)) > LOG_SPEED_EPS_MB_S
-        if paused_by_log is True:
+        pause_decision = None
+        if pause_idx is not None and (resume_idx is None or pause_idx < resume_idx):
+            pause_decision = True
+        elif resume_idx is not None and (pause_idx is None or resume_idx < pause_idx):
+            pause_decision = False
+
+        speed_is_recent = (
+            bytes_per_s_log is not None
+            and pause_decision is not True
+            and (pause_idx is None or speed_idx is not None and speed_idx < pause_idx)
+            and (resume_idx is None or speed_idx is not None and speed_idx < resume_idx)
+            and (bytes_per_s_log / (1024 * 1024)) > LOG_SPEED_EPS_MB_S
+        )
+        bytes_per_s = bytes_per_s_log if speed_is_recent else bytes_per_s_disk
+
+        if pause_decision is True:
             paused = True
-        elif paused_by_log is False:
-            paused = False
+        elif pause_decision is False:
+            paused = paused_by_delta and not speed_is_recent
         else:
-            paused = paused_by_delta if not has_log_speed else False
+            paused = paused_by_delta and not speed_is_recent
 
         status = "PAUSED/IDLE" if paused else "DOWNLOADING"
         print(
             f"[{minute}/5] {game_name} | {status} | "
-            f"speed: {human_mb_per_s(bytes_per_s)} | +{delta / (1024*1024):.2f} MB/min"
+            f"speed: {format_speed(bytes_per_s)} | +{delta / (1024*1024):.2f} MB/min"
         )
 
     print("\nГотово.")
